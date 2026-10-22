@@ -3,19 +3,34 @@ const jwt = require("jsonwebtoken");
 function requireAdmin(req, res, next) {
     const authHeader = req.headers.authorization;
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (typeof process.env.JWT_SECRET !== "string" || !process.env.JWT_SECRET) {
+        return res.status(500).json({
+            message: "Authentication is not configured."
+        });
+    }
+
+    const tokenMatch =
+        typeof authHeader === "string"
+            ? /^Bearer\s+(\S+)$/i.exec(authHeader)
+            : null;
+
+    if (!tokenMatch) {
         return res.status(401).json({
             message: "Authentication required"
         });
     }
 
-    const token = authHeader.split(" ")[1];
-
     try {
         const decoded = jwt.verify(
-            token,
+            tokenMatch[1],
             process.env.JWT_SECRET
         );
+
+        if (!decoded || typeof decoded !== "object") {
+            return res.status(401).json({
+                message: "Invalid or expired token"
+            });
+        }
 
         if (decoded.role !== "admin") {
             return res.status(403).json({
@@ -23,8 +38,15 @@ function requireAdmin(req, res, next) {
             });
         }
 
+        const adminId = Number(decoded.id);
+        if (!Number.isSafeInteger(adminId) || adminId < 1) {
+            return res.status(401).json({
+                message: "Invalid or expired token"
+            });
+        }
+
         req.admin = {
-            id: decoded.id,
+            id: adminId,
             role: decoded.role
         };
 

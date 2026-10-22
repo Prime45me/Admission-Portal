@@ -6,10 +6,12 @@ const { rateLimit } = require("express-rate-limit");
 const pool = require("../db/db");
 
 const router = express.Router();
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  skip: () => process.env.NODE_ENV === "test",
   standardHeaders: true,
   legacyHeaders: false,
   message: {
@@ -25,6 +27,9 @@ router.post("/login", loginLimiter, async (req, res) => {
       typeof email !== "string" ||
       typeof password !== "string" ||
       !email.trim() ||
+      email.trim().length > 150 ||
+      !emailPattern.test(email.trim()) ||
+      email.trim().includes("..") ||
       !password
     ) {
       return res.status(400).json({
@@ -84,7 +89,7 @@ router.post("/login", loginLimiter, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("Login error:", error.message);
+    console.error("Login error:", error.code || "UNKNOWN");
 
     return res.status(500).json({
       message: "An internal server error occurred."

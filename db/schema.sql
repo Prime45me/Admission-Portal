@@ -28,19 +28,42 @@ CREATE TABLE IF NOT EXISTS applications (
     phone_number VARCHAR(30) NOT NULL,
     address TEXT NOT NULL,
     class_applied_for VARCHAR(100) NOT NULL,
-    status VARCHAR(30) DEFAULT 'NEW',
+    status VARCHAR(30) NOT NULL DEFAULT 'new',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Keep existing development databases aligned with the API's uppercase statuses.
+-- Replace the status constraint as existing values are normalized.
+ALTER TABLE applications
+    DROP CONSTRAINT IF EXISTS applications_status_check;
+
 UPDATE applications
-SET status = UPPER(status)
+SET status = LOWER(status)
 WHERE status IS NOT NULL
-  AND status <> UPPER(status);
+  AND status <> LOWER(status);
+
+UPDATE applications
+SET status = 'new'
+WHERE status IS NULL;
 
 ALTER TABLE applications
-    ALTER COLUMN status SET DEFAULT 'NEW';
+    ALTER COLUMN status SET DEFAULT 'new',
+    ALTER COLUMN status SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'applications'::regclass
+          AND conname = 'applications_status_check'
+    ) THEN
+        ALTER TABLE applications
+            ADD CONSTRAINT applications_status_check
+            CHECK (status IN ('new', 'under_review', 'accepted', 'rejected'));
+    END IF;
+END
+$$;
 
 -- 3. Guardians
 -- One application may have multiple guardians.
