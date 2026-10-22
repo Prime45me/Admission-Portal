@@ -2,9 +2,12 @@
 const express = require("express");
 const { randomBytes } = require("crypto");
 const pool = require("../db/db");
+const requireAdmin = require("../middleware/requireAdmin");
 
 const router = express.Router();
 
+// POST: Submit a new application.
+// PUBLIC ROUTE: Applicants do not need an admin login.
 router.post("/", async (req, res) => {
   const {
     first_name,
@@ -16,31 +19,61 @@ router.post("/", async (req, res) => {
     phone,
     address,
     class_applied_for,
+    guardian,
   } = req.body;
 
-  // 1. Validate required fields
   if (
-    !first_name ||
-    !last_name ||
+    !first_name?.trim() ||
+    !last_name?.trim() ||
     !date_of_birth ||
     !gender ||
-    !email ||
-    !phone ||
-    !address ||
-    !class_applied_for
+    !email?.trim() ||
+    !phone?.trim() ||
+    !address?.trim() ||
+    !class_applied_for?.trim()
   ) {
     return res.status(400).json({
-      message: "Please provide all required fields.",
+      message: "Please provide all required applicant fields.",
     });
   }
 
-  try {
-    // 2. Generate a public application reference
-    const application_number =
-      `PEN-${new Date().getFullYear()}-${randomBytes(4).toString("hex").toUpperCase()}`;
+  if (
+    !guardian?.full_name?.trim() ||
+    !guardian?.relationship?.trim() ||
+    !guardian?.phone_number?.trim()
+  ) {
+    return res.status(400).json({
+      message:
+        "Guardian name, relationship, and phone number are required.",
+    });
+  }
 
-    // 3. Save the application in PostgreSQL
-    const result = await pool.query(
+  // Email is optional, but if supplied, it must be a non-empty string.
+  if (
+    guardian.email !== undefined &&
+    guardian.email !== null &&
+    (typeof guardian.email !== "string" ||
+      !guardian.email.trim())
+  ) {
+    return res.status(400).json({
+      message: "Guardian email must be a valid non-empty string if provided.",
+    });
+  }
+
+  const guardianEmail = guardian.email?.trim() || null;
+
+  let client;
+
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const applicationNumber =
+      `PEN-${new Date().getFullYear()}-${randomBytes(4)
+        .toString("hex")
+        .toUpperCase()}`;
+
+    const applicationResult = await client.query(
       `INSERT INTO applications (
         application_number,
         first_name,
@@ -56,12 +89,12 @@ router.post("/", async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING id, application_number, first_name, last_name, status, created_at`,
       [
-        application_number,
+        applicationNumber,
         first_name.trim(),
         middle_name?.trim() || null,
         last_name.trim(),
         date_of_birth,
-        gender,
+        gender.trim(),
         email.trim(),
         phone.trim(),
         address.trim(),
@@ -69,23 +102,63 @@ router.post("/", async (req, res) => {
       ]
     );
 
-    // 4. Return the saved application
+    const application = applicationResult.rows[0];
+
+    const guardianResult = await client.query(
+      `INSERT INTO guardians (
+        application_id,
+        full_name,
+        relationship,
+        phone_number,
+        email,
+        address
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING id, full_name, relationship, phone_number, email, address`,
+      [
+        application.id,
+        guardian.full_name.trim(),
+        guardian.relationship.trim(),
+        guardian.phone_number.trim(),
+        guardianEmail,
+        guardian.address?.trim() || null,
+      ]
+    );
+
+    await client.query("COMMIT");
+
     return res.status(201).json({
-      message: "Application submitted successfully.",
-      application: result.rows[0],
+      message: "Application and guardian submitted successfully.",
+      application,
+      guardian: guardianResult.rows[0],
     });
   } catch (error) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error(
+          "Transaction rollback error:",
+          rollbackError.message
+        );
+      }
+    }
+
     console.error("Application submission error:", error.message);
 
     return res.status(500).json({
       message: "Unable to submit application. Please try again.",
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
-
-
-router.get("/", async (req, res) => {
+// GET: Retrieve applications with filtering and pagination.
+// PROTECTED ROUTE: Admin authentication required.
+router.get("/", requireAdmin, async (req, res) => {
   try {
     const { status, class: classAppliedFor, search } = req.query;
 
@@ -115,7 +188,7 @@ router.get("/", async (req, res) => {
     const values = [];
 
     if (status) {
-      values.push(status.toUpperCase());
+      values.push(status.toLowerCase());
       query += ` AND status = $${values.length}`;
     }
 
@@ -134,7 +207,6 @@ router.get("/", async (req, res) => {
       )`;
     }
 
-    // Count all records matching the filters
     const countResult = await pool.query(
       `SELECT COUNT(*) FROM (${query}) AS filtered_applications`,
       values
@@ -142,7 +214,6 @@ router.get("/", async (req, res) => {
 
     const total = Number(countResult.rows[0].count);
 
-    // Add pagination
     values.push(limit);
     query += ` ORDER BY created_at DESC LIMIT $${values.length}`;
 
@@ -151,7 +222,7 @@ router.get("/", async (req, res) => {
 
     const result = await pool.query(query, values);
 
-    res.status(200).json({
+    return res.status(200).json({
       page,
       limit,
       total,
@@ -161,14 +232,15 @@ router.get("/", async (req, res) => {
   } catch (error) {
     console.error("Fetch applications error:", error.message);
 
-    res.status(500).json({
+    return res.status(500).json({
       message: "Unable to retrieve applications.",
     });
   }
 });
 
-
-router.patch("/:id/status", async (req, res) => {
+// PATCH: Update an application's status.
+// PROTECTED ROUTE: Admin authentication required.
+router.patch("/:id/status", requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
 
@@ -179,13 +251,16 @@ router.patch("/:id/status", async (req, res) => {
     "REJECTED",
   ];
 
-  if (!Number.isInteger(Number(id)) || Number(id) < 1) {
+  if (!/^[1-9]\d*$/.test(id)) {
     return res.status(400).json({
       message: "Invalid application ID.",
     });
   }
 
-  if (!allowedStatuses.includes(status)) {
+  if (
+    typeof status !== "string" ||
+    !allowedStatuses.includes(status.toUpperCase())
+  ) {
     return res.status(400).json({
       message: "Invalid status.",
       allowedStatuses,
@@ -193,13 +268,15 @@ router.patch("/:id/status", async (req, res) => {
   }
 
   try {
+    const normalizedStatus = status.toUpperCase();
+
     const result = await pool.query(
       `UPDATE applications
        SET status = $1,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $2
        RETURNING id, application_number, status, updated_at`,
-      [status, Number(id)]
+      [normalizedStatus.toLowerCase(), Number(id)]
     );
 
     if (result.rowCount === 0) {
@@ -221,32 +298,81 @@ router.patch("/:id/status", async (req, res) => {
   }
 });
 
+// GET: Dashboard application statistics.
+// PROTECTED ROUTE: Admin authentication required.
+router.get("/stats", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'new') AS new,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'under_review') AS under_review,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'accepted') AS accepted,
+        COUNT(*) FILTER (WHERE LOWER(status) = 'rejected') AS rejected
+      FROM applications
+    `);
 
-router.get("/:id", async (req, res) => {
+    const row = result.rows[0];
+
+    return res.status(200).json({
+      total: Number(row.total),
+      new: Number(row.new),
+      under_review: Number(row.under_review),
+      accepted: Number(row.accepted),
+      rejected: Number(row.rejected),
+    });
+  } catch (error) {
+    console.error("Dashboard statistics error:", error.message);
+
+    return res.status(500).json({
+      message: "Unable to retrieve dashboard statistics.",
+    });
+  }
+});
+
+// GET: Retrieve one application and all its guardians.
+// PROTECTED ROUTE: Admin authentication required.
+router.get("/:id", requireAdmin, async (req, res) => {
   const { id } = req.params;
 
-  if (!Number.isInteger(Number(id)) || Number(id) < 1) {
+  if (!/^[1-9]\d*$/.test(id)) {
     return res.status(400).json({
       message: "Invalid application ID.",
     });
   }
 
   try {
-    const result = await pool.query(
+    const applicationResult = await pool.query(
       `SELECT *
        FROM applications
        WHERE id = $1`,
       [Number(id)]
     );
 
-    if (result.rowCount === 0) {
+    if (applicationResult.rowCount === 0) {
       return res.status(404).json({
         message: "Application not found.",
       });
     }
 
+    const guardiansResult = await pool.query(
+      `SELECT
+        id,
+        full_name,
+        relationship,
+        phone_number,
+        email,
+        address,
+        created_at
+       FROM guardians
+       WHERE application_id = $1
+       ORDER BY id`,
+      [Number(id)]
+    );
+
     return res.status(200).json({
-      application: result.rows[0],
+      application: applicationResult.rows[0],
+      guardians: guardiansResult.rows,
     });
   } catch (error) {
     console.error("Fetch application error:", error.message);
@@ -256,5 +382,7 @@ router.get("/:id", async (req, res) => {
     });
   }
 });
+
+
 
 module.exports = router;

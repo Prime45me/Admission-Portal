@@ -2,10 +2,12 @@ const express = require("express");
 require("dotenv").config();
 const app = express();
 const pool = require("./db/db.js");
+const authRoutes = require("./routes/auth.js");
 const applicationRoutes = require("./routes/application.js");
 const PORT = process.env.PORT || 5000;
 
 app.use(express.json());
+app.use("/api/auth", authRoutes);
 app.use("/api/applications",applicationRoutes);
 
 app.get("/", (req,res) => {
