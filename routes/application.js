@@ -1,6 +1,6 @@
 
 const express = require("express");
-const { randomBytes } = require("crypto");
+const { randomBytes, createHash } = require("crypto");
 const pool = require("../db/db");
 const requireAdmin = require("../middleware/requireAdmin");
 
@@ -139,6 +139,38 @@ function parseApplicationId(value) {
   return parsed !== null && parsed <= 2147483647 ? parsed : null;
 }
 
+function getIdempotencyKeyFromRequest(req) {
+  const headerKey = req.headers["idempotency-key"];
+  const headerValue = Array.isArray(headerKey) ? headerKey[0] : headerKey;
+  const bodyKey = req.body && typeof req.body.idempotency_key === "string"
+    ? req.body.idempotency_key
+    : null;
+  const candidate = typeof headerValue === "string"
+    ? headerValue
+    : bodyKey;
+
+  if (typeof candidate !== "string") {
+    return null;
+  }
+
+  const trimmed = candidate.trim();
+  return trimmed && trimmed.length <= 128 ? trimmed : null;
+}
+
+function hashIdempotencyKey(key) {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+function isIdempotencyKeyCollision(error) {
+  return (
+    error &&
+    error.code === "23505" &&
+    (error.constraint === "application_idempotency_keys_key_hash_key" ||
+      (typeof error.message === "string" &&
+        error.message.includes("application_idempotency_keys_key_hash_key")))
+  );
+}
+
 function isApplicationNumberCollision(error) {
   return (
     error &&
@@ -157,6 +189,9 @@ router.post("/", async (req, res) => {
       message: "Request body must be a JSON object.",
     });
   }
+
+  const idempotencyKey = getIdempotencyKeyFromRequest(req);
+  const idempotencyHash = idempotencyKey ? hashIdempotencyKey(idempotencyKey) : null;
 
   const {
     first_name,
@@ -269,6 +304,9 @@ router.post("/", async (req, res) => {
     typeof middle_name === "string" && middle_name.trim()
       ? middle_name.trim()
       : null;
+  const normalizedGuardianName = guardian.full_name.trim();
+  const normalizedGuardianRelationship = guardian.relationship.trim();
+  const normalizedGuardianPhone = guardianPhone.trim();
 
   let client;
   let transactionStarted = false;
@@ -276,8 +314,91 @@ router.post("/", async (req, res) => {
   try {
     client = await pool.connect();
 
+    if (idempotencyHash) {
+      const existingKeyResult = await client.query(
+        `SELECT application_id
+         FROM application_idempotency_keys
+         WHERE key_hash = $1
+           AND expires_at > NOW()
+         LIMIT 1`,
+        [idempotencyHash]
+      );
+
+      if (existingKeyResult.rowCount > 0) {
+        const applicationId = existingKeyResult.rows[0].application_id;
+        const applicationResult = await client.query(
+          `SELECT id, application_number, first_name, last_name, status, created_at
+           FROM applications
+           WHERE id = $1`,
+          [applicationId]
+        );
+
+        if (applicationResult.rowCount > 0) {
+          const application = applicationResult.rows[0];
+          const guardianResult = await client.query(
+            `SELECT id, full_name, relationship, phone_number, email, address
+             FROM guardians
+             WHERE application_id = $1
+             ORDER BY id
+             LIMIT 1`,
+            [application.id]
+          );
+
+          return res.status(200).json({
+            message: "Application already submitted.",
+            application,
+            guardian: guardianResult.rows[0] || null,
+          });
+        }
+      }
+    }
+
     await client.query("BEGIN");
     transactionStarted = true;
+
+    if (idempotencyHash) {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+        [idempotencyHash]
+      );
+
+      const existingKeyResult = await client.query(
+        `SELECT application_id
+         FROM application_idempotency_keys
+         WHERE key_hash = $1
+           AND expires_at > NOW()
+         LIMIT 1`,
+        [idempotencyHash]
+      );
+
+      if (existingKeyResult.rowCount > 0) {
+        const applicationId = existingKeyResult.rows[0].application_id;
+        const applicationResult = await client.query(
+          `SELECT id, application_number, first_name, last_name, status, created_at
+           FROM applications
+           WHERE id = $1`,
+          [applicationId]
+        );
+        if (applicationResult.rowCount > 0) {
+          const application = applicationResult.rows[0];
+          const guardianResult = await client.query(
+            `SELECT id, full_name, relationship, phone_number, email, address
+             FROM guardians
+             WHERE application_id = $1
+             ORDER BY id
+             LIMIT 1`,
+            [application.id]
+          );
+          await client.query("COMMIT");
+          transactionStarted = false;
+          return res.status(200).json({
+            message: "Application already submitted.",
+            application,
+            guardian: guardianResult.rows[0] || null,
+          });
+        }
+      }
+    }
 
     // Savepoint allows a rare reference collision to be retried safely.
     let applicationResult;
@@ -330,27 +451,67 @@ router.post("/", async (req, res) => {
 
     const application = applicationResult.rows[0];
 
-    // Insert the guardian linked to the application.
-    const guardianResult = await client.query(
-      `INSERT INTO guardians (
-        application_id,
+    const existingGuardianResult = await client.query(
+      `SELECT
+        id,
         full_name,
         relationship,
         phone_number,
         email,
         address
-      )
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, full_name, relationship, phone_number, email, address`,
+       FROM guardians
+       WHERE application_id = $1
+         AND LOWER(TRIM(full_name)) = LOWER($2)
+         AND LOWER(TRIM(relationship)) = LOWER($3)
+         AND phone_number = $4
+       LIMIT 1`,
       [
         application.id,
-        guardian.full_name.trim(),
-        guardian.relationship.trim(),
-        guardianPhone.trim(),
-        guardianEmail,
-        guardianAddress,
+        normalizedGuardianName,
+        normalizedGuardianRelationship,
+        normalizedGuardianPhone,
       ]
     );
+
+    const guardianRow =
+      existingGuardianResult.rowCount > 0
+        ? existingGuardianResult.rows[0]
+        : (
+            await client.query(
+              `INSERT INTO guardians (
+                application_id,
+                full_name,
+                relationship,
+                phone_number,
+                email,
+                address
+              )
+              VALUES ($1, $2, $3, $4, $5, $6)
+              RETURNING id, full_name, relationship, phone_number, email, address`,
+              [
+                application.id,
+                normalizedGuardianName,
+                normalizedGuardianRelationship,
+                normalizedGuardianPhone,
+                guardianEmail,
+                guardianAddress,
+              ]
+            )
+          ).rows[0];
+
+    if (idempotencyHash) {
+      try {
+        await client.query(
+          `INSERT INTO application_idempotency_keys (key_hash, application_id, expires_at)
+           VALUES ($1, $2, NOW() + INTERVAL '24 hours')`,
+          [idempotencyHash, application.id]
+        );
+      } catch (error) {
+        if (!isIdempotencyKeyCollision(error)) {
+          throw error;
+        }
+      }
+    }
 
     await client.query("COMMIT");
     transactionStarted = false;
@@ -358,7 +519,7 @@ router.post("/", async (req, res) => {
     return res.status(201).json({
       message: "Application and guardian submitted successfully.",
       application,
-      guardian: guardianResult.rows[0],
+      guardian: guardianRow,
     });
   } catch (error) {
     if (client && transactionStarted) {
@@ -644,4 +805,82 @@ router.get("/:id", requireAdmin, async (req, res) => {
   }
 });
 
+// DELETE: Permanently delete an application and its related records.
+// PROTECTED ROUTE: Admin authentication required.
+router.delete("/:id", requireAdmin, async (req, res) => {
+  const applicationId = parseApplicationId(req.params.id);
+  if (applicationId === null) {
+    return res.status(400).json({
+      message: "Invalid application ID.",
+    });
+  }
+
+  let client;
+  let transactionStarted = false;
+
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const applicationResult = await client.query(
+      `SELECT id, application_number
+       FROM applications
+       WHERE id = $1`,
+      [applicationId]
+    );
+
+    if (applicationResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      transactionStarted = false;
+      return res.status(404).json({
+        message: "Application not found.",
+      });
+    }
+
+    const application = applicationResult.rows[0];
+
+    // Explicitly delete related records to prevent orphaned rows,
+    // complementing the database schema's ON DELETE CASCADE constraints.
+    await client.query("DELETE FROM documents WHERE application_id = $1", [applicationId]);
+    await client.query("DELETE FROM guardians WHERE application_id = $1", [applicationId]);
+
+    await client.query(
+      `DELETE FROM applications
+       WHERE id = $1`,
+      [applicationId]
+    );
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return res.status(200).json({
+      message: "Application deleted successfully.",
+      application: {
+        id: application.id,
+        application_number: application.application_number,
+      },
+    });
+  } catch (error) {
+    if (client && transactionStarted) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback error:", rollbackError.code || "UNKNOWN");
+      }
+    }
+
+    console.error("Delete application error:", error.code || "UNKNOWN");
+
+    return res.status(500).json({
+      message: "Unable to delete application.",
+    });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
 module.exports = router;
+

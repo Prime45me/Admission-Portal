@@ -4,12 +4,12 @@ Peniel Admission Portal is an early-stage school admissions project. The code cu
 
 > **Development project:** This repository is being built incrementally. The current implementation and setup are for development and learning, not a finished or production-ready admissions system. Production deployment is a later project phase, not a requirement for the current work.
 
-The applicant-facing website and staff dashboard are not implemented yet. The backend includes a starter schema, a status migration, and API tests using Node's built-in test runner. This README describes the current implementation, not planned or completed functionality. See [PROJECT_PROGRESS.md](./PROJECT_PROGRESS.md) for the current status and outstanding work.
+The school website frontend lives in the sibling `frontend/` directory (React 18, Vite 6, TypeScript, React Router, and Tailwind CSS v4). Its applicant-facing admissions form is integrated with this backend API. A staff dashboard and self-service application-status lookup remain future tasks. The backend includes a starter schema, status migration, and a test suite using Node's built-in test runner. See [PROJECT_PROGRESS.md](./PROJECT_PROGRESS.md) for the current status and work plan.
 
 ## Current capabilities
 
 - Accept an applicant's basic details and guardian details.
-- Save an application and its guardian record in a single database transaction.
+- Save an application and its guardian record in a single database transaction, reusing a matching guardian record if one is already linked to that application.
 - Generate an application reference in the format `PEN-<year>-<random code>`.
 - List applications with optional status, class, and text search filters, plus pagination.
 - Retrieve an application together with all guardian records.
@@ -21,8 +21,8 @@ The applicant-facing website and staff dashboard are not implemented yet. The ba
 - Limit repeated login attempts.
 - Check whether the API can connect to PostgreSQL.
 - Define starter PostgreSQL tables for administrators, applications, guardians, and uploaded-document metadata.
+- **Frontend Admission Integration:** Online application form at `/admissions?section=apply`, pre-validation (Ghanaian phone formats, non-future calendar DOB, email syntax), snake_case API payload mapping, loading/duplicate submission locks, graceful error preservation, and genuine printable confirmation slip with the generated `PEN-YEAR-HEX` reference.
 
-These are backend API capabilities only. There is no browser interface or public application-status lookup in the current code.
 
 ## Technology
 
@@ -186,7 +186,7 @@ Example:
 }
 ```
 
-`middle_name`, guardian `address`, and guardian `email` are optional; `null` is accepted for optional fields. On success, returns HTTP 201 with the created application and guardian details. The application and guardian inserts are atomic. Application reference collisions on the unique `application_number` constraint are retried up to three times.
+`middle_name`, guardian `address`, and guardian `email` are optional; `null` is accepted for optional fields. On success, returns HTTP 201 with the created application and guardian details. Application and guardian database operations run in one transaction. Before inserting a guardian, the endpoint checks for a matching name (case-insensitive), relationship (case-insensitive), and phone number under that application and reuses a match if found. To prevent double-click or retry duplication, send an `Idempotency-Key` header (or `idempotency_key` in the JSON body) with a stable unique value; the server stores the hash and returns the original application record for the same key within 24 hours instead of creating another application. Application reference collisions on the unique `application_number` constraint are retried up to three times.
 
 #### `GET /api/applications`
 
@@ -250,7 +250,7 @@ The starter schema in `db/schema.sql` defines:
 - `documents`: metadata for files linked to applications with `ON DELETE CASCADE`. Actual files are expected to be stored outside PostgreSQL.
 - Indexes for application status, class, creation time, and application-to-guardian/document lookup.
 
-There are no document upload or retrieval routes in the current API; `documents` is schema support only. The current submission endpoint inserts one guardian per request, even though the schema supports multiple guardians.
+There are no document upload or retrieval routes in the current API; `documents` is schema support only. The current submission endpoint accepts one guardian per request, even though the schema supports multiple guardians. It reuses a matching guardian already linked to the application being created, but it does not prevent duplicate application records when the same submission is posted again.
 
 Application statuses use lowercase values (`new`, `under_review`, `accepted`, `rejected`) consistently in the schema and routes. The status column is `NOT NULL`, defaults to `new`, and is constrained to those values. Guardian email is optional in both the route and schema.
 
@@ -275,12 +275,43 @@ Available npm scripts:
 | `npm run dev` | Runs `nodemon server.js`. |
 | `npm test` | Runs the API suite with Node's built-in test runner (`node --test`). Latest run: 56 tests passed. |
 
+## Frontend integration
+
+The school website frontend is in the sibling `frontend/` directory. It is a React 18 and TypeScript single-page application built with Vite 6, React Router DOM 6, and Tailwind CSS v4. The current routes are Home (`/`), About (`/about`), Academics (`/academics`), Admissions (`/admissions`), Gallery (`/gallery`), Contact (`/contact`), and Privacy (`/privacy`).
+
+The admissions page provides an application form that submits to `POST /api/applications`. The frontend validates Ghanaian phone numbers, date of birth, and email before submission; maps form values to the backend's snake_case request fields; prevents repeated clicks while a submission is in progress; and displays the returned application reference in a printable confirmation. Application submission errors are shown in the form. Supplementary form fields not currently supported by the backend are not included in the API payload.
+
+Configure `VITE_API_BASE_URL` in `..\frontend\.env` to point to the backend (defaults to `http://localhost:5000`; see `..\frontend\.env.example`). Set the backend's `CORS_ORIGINS` to include the frontend development origin, normally `http://localhost:5173`.
+
+### Running frontend and backend together
+
+1. **Start the backend server:**
+   ```powershell
+   cd backend
+   npm run dev
+   # Runs on http://localhost:5000
+   ```
+
+2. **Start the frontend application:**
+   ```powershell
+   cd ..\frontend
+   npm install
+   npm run dev
+   # Runs on http://localhost:5173
+   ```
+
+3. Visit `http://localhost:5173/admissions?section=apply` to test admissions submission end-to-end. Run `npm run build` from `frontend/` to build the frontend for production.
+
+The staff dashboard and public application-status lookup are not part of the current frontend implementation.
+
 ## Development roadmap
 
-- Decide authoritative lists for permitted gender values and school classes; validation currently enforces type and length only for those fields.
-- Continue adding tests as new API behavior is introduced.
-- Build the applicant form and staff dashboard.
-- Decide whether applicants need a safe way to check application status.
-- Address deployment, monitoring, backups, and privacy safeguards in a later release phase.
+- [x] Integrate applicant admissions form with `POST /api/applications`.
+- [x] Implement genuine application reference generation and printable confirmation slip.
+- [ ] Decide authoritative lists for permitted gender values and school classes; validation currently enforces type and length only for those fields.
+- [ ] Implement self-service applicant status lookup page (`/admissions/status`).
+- [ ] Build staff web interface for authentication, application review, search/filter, and status updates.
+- [ ] Decide whether document uploads are part of the applicant workflow; if so, implement upload/storage/retrieval behavior around the existing metadata table.
+- [ ] Address deployment, monitoring, backups, and privacy safeguards in a later release phase.
 
 For the evolving implementation status, see [PROJECT_PROGRESS.md](./PROJECT_PROGRESS.md).

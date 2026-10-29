@@ -324,6 +324,9 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     const mockClient = {
       query: async (sql, params) => {
         queriesExecuted.push({ sql: sql.trim(), params });
+        if (sql.includes("SELECT application_id") || sql.includes("INSERT INTO application_idempotency_keys")) {
+          return { rowCount: 0, rows: [] };
+        }
         if (sql.includes("BEGIN") || sql.includes("SAVEPOINT") || sql.includes("RELEASE") || sql.includes("COMMIT")) {
           return { rowCount: 0, rows: [] };
         }
@@ -341,6 +344,9 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
               },
             ],
           };
+        }
+        if (sql.includes("SELECT\n        id,\n        full_name")) {
+          return { rowCount: 0, rows: [] };
         }
         if (sql.includes("INSERT INTO guardians")) {
           return {
@@ -387,6 +393,69 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     }
   });
 
+  await t.test("reuses existing guardian row when the same guardian is resubmitted for the same application", async () => {
+    const originalConnect = pool.connect;
+    const mockClient = {
+      query: async (sql, params) => {
+        if (sql.includes("SELECT application_id") || sql.includes("INSERT INTO application_idempotency_keys")) {
+          return { rowCount: 0, rows: [] };
+        }
+        if (sql.includes("BEGIN") || sql.includes("SAVEPOINT") || sql.includes("RELEASE") || sql.includes("COMMIT")) {
+          return { rowCount: 0, rows: [] };
+        }
+        if (sql.includes("INSERT INTO applications")) {
+          return {
+            rowCount: 1,
+            rows: [{
+              id: 102,
+              application_number: "PEN-2026-TEST5678",
+              first_name: "Kwame",
+              last_name: "Mensah",
+              status: "new",
+              created_at: new Date().toISOString(),
+            }],
+          };
+        }
+        if (sql.includes("SELECT\n        id,\n        full_name")) {
+          return {
+            rowCount: 1,
+            rows: [{
+              id: 202,
+              full_name: "Ama Mensah",
+              relationship: "Mother",
+              phone_number: "0247654321",
+              email: "ama.mensah@example.com",
+              address: "123 Independence Avenue, Accra",
+            }],
+          };
+        }
+        if (sql.includes("INSERT INTO guardians")) {
+          throw new Error("Duplicate guardian insert should not run for an existing guardian record.");
+        }
+        return { rowCount: 0, rows: [] };
+      },
+      release: () => {},
+    };
+
+    pool.connect = async () => mockClient;
+
+    try {
+      const payload = validApplicationPayload();
+      const res = await fetch(`${testEnv.baseUrl}/api/applications`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const body = await res.json();
+      assert.strictEqual(res.status, 201);
+      assert.strictEqual(body.guardian.id, 202);
+      assert.strictEqual(body.guardian.full_name, "Ama Mensah");
+    } finally {
+      pool.connect = originalConnect;
+    }
+  });
+
   await t.test("rolls back transaction when guardian insert fails", async () => {
     const originalConnect = pool.connect;
 
@@ -394,6 +463,9 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     const mockClient = {
       query: async (sql, params) => {
         queriesExecuted.push({ sql: sql.trim(), params });
+        if (sql.includes("SELECT application_id") || sql.includes("INSERT INTO application_idempotency_keys")) {
+          return { rowCount: 0, rows: [] };
+        }
         if (sql.includes("BEGIN") || sql.includes("SAVEPOINT") || sql.includes("RELEASE")) {
           return { rowCount: 0, rows: [] };
         }
@@ -480,6 +552,70 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     }
   });
 
+  await t.test("returns the original application when the same idempotency key is reused", async () => {
+    const originalConnect = pool.connect;
+    const mockClient = {
+      query: async (sql, params) => {
+        if (sql.includes("SELECT application_id")) {
+          return {
+            rowCount: 1,
+            rows: [{ application_id: 99 }],
+          };
+        }
+        if (sql.includes("SELECT id, application_number, first_name, last_name, status, created_at")) {
+          return {
+            rowCount: 1,
+            rows: [{
+              id: 99,
+              application_number: "PEN-2026-IDEMPOTENT",
+              first_name: "Kwame",
+              last_name: "Mensah",
+              status: "new",
+              created_at: new Date().toISOString(),
+            }],
+          };
+        }
+        if (sql.includes("SELECT id, full_name, relationship, phone_number, email, address")) {
+          return {
+            rowCount: 1,
+            rows: [{
+              id: 999,
+              full_name: "Ama Mensah",
+              relationship: "Mother",
+              phone_number: "0247654321",
+              email: "ama.mensah@example.com",
+              address: "123 Independence Avenue, Accra",
+            }],
+          };
+        }
+        return { rowCount: 0, rows: [] };
+      },
+      release: () => {},
+    };
+
+    pool.connect = async () => mockClient;
+
+    try {
+      const payload = validApplicationPayload();
+      const res = await fetch(`${testEnv.baseUrl}/api/applications`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "duplicate-request-key-123",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const body = await res.json();
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(body.message, "Application already submitted.");
+      assert.strictEqual(body.application.id, 99);
+      assert.strictEqual(body.guardian.id, 999);
+    } finally {
+      pool.connect = originalConnect;
+    }
+  });
+
   await t.test("safely handles application number collision with retry", async () => {
     const originalConnect = pool.connect;
 
@@ -488,6 +624,9 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     const mockClient = {
       query: async (sql, params) => {
         queriesExecuted.push({ sql: sql.trim(), params });
+        if (sql.includes("SELECT application_id") || sql.includes("INSERT INTO application_idempotency_keys")) {
+          return { rowCount: 0, rows: [] };
+        }
         if (sql.includes("BEGIN") || sql.includes("SAVEPOINT") || sql.includes("RELEASE") || sql.includes("COMMIT")) {
           return { rowCount: 0, rows: [] };
         }
