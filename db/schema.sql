@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS applications (
     phone_number VARCHAR(30) NOT NULL,
     address TEXT NOT NULL,
     class_applied_for VARCHAR(100) NOT NULL,
+    current_previous_school TEXT,
+    additional_information TEXT,
     status VARCHAR(30) NOT NULL DEFAULT 'new',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -96,6 +98,8 @@ CREATE TABLE IF NOT EXISTS documents (
     document_type VARCHAR NOT NULL,
     filename VARCHAR NOT NULL,
     storage_path TEXT NOT NULL,
+    mime_type VARCHAR(100),
+    file_size INTEGER,
     uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_document_application
@@ -122,11 +126,15 @@ CREATE INDEX IF NOT EXISTS guardians_application_id_idx
 CREATE INDEX IF NOT EXISTS documents_application_id_idx
     ON documents(application_id);
 
+CREATE INDEX IF NOT EXISTS documents_application_type_idx
+    ON documents(application_id, document_type);
+
 -- 5. Request idempotency keys to prevent duplicate application retries.
 CREATE TABLE IF NOT EXISTS application_idempotency_keys (
     id SERIAL PRIMARY KEY,
     key_hash VARCHAR(128) NOT NULL UNIQUE,
     application_id INTEGER NOT NULL,
+    payload_fingerprint VARCHAR(64),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '24 hours'),
 
@@ -138,5 +146,29 @@ CREATE TABLE IF NOT EXISTS application_idempotency_keys (
 
 CREATE INDEX IF NOT EXISTS application_idempotency_keys_expires_at_idx
     ON application_idempotency_keys(expires_at);
+
+-- 6. Administrator password reset tokens.
+CREATE TABLE IF NOT EXISTS admin_password_reset_tokens (
+    id SERIAL PRIMARY KEY,
+    admin_id INTEGER NOT NULL,
+    token_hash VARCHAR(64) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_admin_password_reset_admin
+        FOREIGN KEY (admin_id)
+        REFERENCES admins(id)
+        ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS admin_password_reset_tokens_token_hash_uq
+    ON admin_password_reset_tokens(token_hash);
+
+CREATE INDEX IF NOT EXISTS admin_password_reset_tokens_admin_id_idx
+    ON admin_password_reset_tokens(admin_id);
+
+CREATE INDEX IF NOT EXISTS admin_password_reset_tokens_expires_at_idx
+    ON admin_password_reset_tokens(expires_at);
 
 COMMIT;

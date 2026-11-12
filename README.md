@@ -8,7 +8,7 @@ The school website frontend lives in the sibling `frontend/` directory (React 18
 
 ## Current capabilities
 
-- Accept an applicant's basic details and guardian details.
+- Accept an applicant's basic details, guardian details, and a required passport photograph.
 - Save an application and its guardian record in a single database transaction, reusing a matching guardian record if one is already linked to that application.
 - Generate an application reference in the format `PEN-<year>-<random code>`.
 - List applications with optional status, class, and text search filters, plus pagination.
@@ -21,6 +21,9 @@ The school website frontend lives in the sibling `frontend/` directory (React 18
 - Limit repeated login attempts.
 - Check whether the API can connect to PostgreSQL.
 - Define starter PostgreSQL tables for administrators, applications, guardians, and uploaded-document metadata.
+- Upload passport photographs to the private Supabase Storage bucket and store verified metadata in PostgreSQL.
+- Generate short-lived signed URLs for authenticated administrator access.
+- Send an optional Resend application-confirmation email only after a new successful submission.
 - **Frontend Admission Integration:** Online application form at `/admissions?section=apply`, pre-validation (Ghanaian phone formats, non-future calendar DOB, email syntax), snake_case API payload mapping, loading/duplicate submission locks, graceful error preservation, and genuine printable confirmation slip with the generated `PEN-YEAR-HEX` reference.
 
 
@@ -129,6 +132,20 @@ The development database was inspected read-only and already had the expected lo
 
 `npm run dev` starts the server with Nodemon. Use `npm start` to run it without Nodemon. The server listens on the configured port.
 
+## Passport photographs and confirmation email
+
+Application submission is multipart and requires a `passport` file in addition to the JSON form fields encoded as the `application` field. The browser must send up to 5 MB as JPEG, PNG, or WebP. The server verifies the file signature, stores it in a private Supabase Storage bucket, and records metadata in the existing `documents` table. For an existing database, apply:
+
+```powershell
+psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migrations\003_passport_document_metadata.sql
+```
+
+Use the existing private Supabase Storage bucket named `applicant-documents`; confirm `SUPABASE_STORAGE_BUCKET=applicant-documents` in the backend environment. Do not create another bucket or make this bucket public. The service-role key must remain only in the backend environment. Suggested environment variables are documented in `.env.example`.
+
+When configured, Resend sends an HTML/plain-text confirmation after a first successful application commit. Duplicate idempotent retries do not send a second confirmation. If Resend is not configured or delivery fails, the application remains successfully submitted; delivery failures are logged without applicant-facing secret or API details.
+
+Administrators can access a photograph through the protected `GET /api/applications/:id/passport` endpoint. It verifies the application/document association and returns a signed URL valid for five minutes.
+
 To check the API is responding, visit `http://localhost:5000/`. To check the database connection, request `http://localhost:5000/api/db-test`. The database check returns the database name when the connection succeeds; otherwise it returns HTTP 500.
 
 ## API
@@ -186,7 +203,9 @@ Example:
 }
 ```
 
-`middle_name`, guardian `address`, and guardian `email` are optional; `null` is accepted for optional fields. On success, returns HTTP 201 with the created application and guardian details. Application and guardian database operations run in one transaction. Before inserting a guardian, the endpoint checks for a matching name (case-insensitive), relationship (case-insensitive), and phone number under that application and reuses a match if found. To prevent double-click or retry duplication, send an `Idempotency-Key` header (or `idempotency_key` in the JSON body) with a stable unique value; the server stores the hash and returns the original application record for the same key within 24 hours instead of creating another application. Application reference collisions on the unique `application_number` constraint are retried up to three times.
+`middle_name`, guardian `address`, guardian `email`, `current_previous_school`, and `additional_information` are optional; `null` is accepted for optional fields. Whitespace-only text is stored as `NULL`, and `additional_information` is limited to 2,000 characters. On success, returns HTTP 201 with the created application and guardian details. Application and guardian database operations run in one transaction. Before inserting a guardian, the endpoint checks for a matching name (case-insensitive), relationship (case-insensitive), and phone number under that application and reuses a match if found.
+
+To prevent double-click or retry duplication, send an `Idempotency-Key` header (or `idempotency_key` in the JSON body) with a stable unique value. The server hashes the key, uses a PostgreSQL transaction advisory lock, and stores a SHA-256 payload fingerprint together with the original application. The fingerprint includes normalized application and guardian details, `current_previous_school`, `additional_information`, and the SHA-256 hash of the passport bytes. Identical repeated payloads return the original result within 24 hours. Reuse of the key with changed details or a changed/missing photograph returns HTTP 409, and existing records without a fingerprint are not assumed to match. Application reference collisions are retried up to three times.
 
 #### `GET /api/applications`
 
@@ -250,7 +269,7 @@ The starter schema in `db/schema.sql` defines:
 - `documents`: metadata for files linked to applications with `ON DELETE CASCADE`. Actual files are expected to be stored outside PostgreSQL.
 - Indexes for application status, class, creation time, and application-to-guardian/document lookup.
 
-There are no document upload or retrieval routes in the current API; `documents` is schema support only. The current submission endpoint accepts one guardian per request, even though the schema supports multiple guardians. It reuses a matching guardian already linked to the application being created, but it does not prevent duplicate application records when the same submission is posted again.
+The `documents` table stores passport metadata only; image binaries remain in private Supabase Storage. The current submission endpoint accepts one guardian per request, even though the schema supports multiple guardians. It reuses a matching guardian already linked to the application being created. Database-backed idempotency keys prevent retries from creating duplicate application records.
 
 Application statuses use lowercase values (`new`, `under_review`, `accepted`, `rejected`) consistently in the schema and routes. The status column is `NOT NULL`, defaults to `new`, and is constrained to those values. Guardian email is optional in both the route and schema.
 
@@ -273,13 +292,13 @@ Available npm scripts:
 | --- | --- |
 | `npm start` | Runs `node server.js`. |
 | `npm run dev` | Runs `nodemon server.js`. |
-| `npm test` | Runs the API suite with Node's built-in test runner (`node --test`). Latest run: 56 tests passed. |
+| `npm test` | Runs the API suite with Node's built-in test runner (`node --test`). Latest run: 74 tests passed. |
 
 ## Frontend integration
 
 The school website frontend is in the sibling `frontend/` directory. It is a React 18 and TypeScript single-page application built with Vite 6, React Router DOM 6, and Tailwind CSS v4. The current routes are Home (`/`), About (`/about`), Academics (`/academics`), Admissions (`/admissions`), Gallery (`/gallery`), Contact (`/contact`), and Privacy (`/privacy`).
 
-The admissions page provides an application form that submits to `POST /api/applications`. The frontend validates Ghanaian phone numbers, date of birth, and email before submission; maps form values to the backend's snake_case request fields; prevents repeated clicks while a submission is in progress; and displays the returned application reference in a printable confirmation. Application submission errors are shown in the form. Supplementary form fields not currently supported by the backend are not included in the API payload.
+The admissions page provides an application form that submits to `POST /api/applications` as multipart data. It validates Ghanaian phone numbers, date of birth, and email; enforces a 5 MB JPEG, PNG, or WebP passport selection; previews and allows replacement/removal before submission; maps form values to the backend's snake_case fields; prevents repeated clicks while a submission is in progress; and displays the returned application reference in a printable confirmation.
 
 Configure `VITE_API_BASE_URL` in `..\frontend\.env` to point to the backend (defaults to `http://localhost:5000`; see `..\frontend\.env.example`). Set the backend's `CORS_ORIGINS` to include the frontend development origin, normally `http://localhost:5173`.
 
@@ -302,16 +321,19 @@ Configure `VITE_API_BASE_URL` in `..\frontend\.env` to point to the backend (def
 
 3. Visit `http://localhost:5173/admissions?section=apply` to test admissions submission end-to-end. Run `npm run build` from `frontend/` to build the frontend for production.
 
-The staff dashboard and public application-status lookup are not part of the current frontend implementation.
+The staff dashboard and protected application/passport APIs are implemented. Public application-status lookup remains future frontend work.
 
 ## Development roadmap
 
 - [x] Integrate applicant admissions form with `POST /api/applications`.
 - [x] Implement genuine application reference generation and printable confirmation slip.
+- [x] Add database-backed idempotency for repeated application submissions.
+- [x] Implement private Supabase passport storage, document metadata, cleanup, and protected signed-URL retrieval.
+- [x] Implement optional Resend confirmation email delivery after a first successful submission.
 - [ ] Decide authoritative lists for permitted gender values and school classes; validation currently enforces type and length only for those fields.
 - [ ] Implement self-service applicant status lookup page (`/admissions/status`).
-- [ ] Build staff web interface for authentication, application review, search/filter, and status updates.
-- [ ] Decide whether document uploads are part of the applicant workflow; if so, implement upload/storage/retrieval behavior around the existing metadata table.
+- [x] Provide staff API support for authentication, application review, search/filter, status updates, and passport retrieval.
+- [ ] Complete remaining staff dashboard experience and end-to-end visual verification.
 - [ ] Address deployment, monitoring, backups, and privacy safeguards in a later release phase.
 
 For the evolving implementation status, see [PROJECT_PROGRESS.md](./PROJECT_PROGRESS.md).

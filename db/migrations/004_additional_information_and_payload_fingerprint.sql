@@ -1,0 +1,15 @@
+BEGIN;
+
+ALTER TABLE applications
+  ADD COLUMN IF NOT EXISTS current_previous_school TEXT,
+  ADD COLUMN IF NOT EXISTS additional_information TEXT;
+
+ALTER TABLE application_idempotency_keys
+  ADD COLUMN IF NOT EXISTS payload_fingerprint VARCHAR(64);
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS mime_type VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS file_size INTEGER,
+  ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+COMMIT;

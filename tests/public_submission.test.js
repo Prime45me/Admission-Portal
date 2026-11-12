@@ -120,6 +120,79 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     }
   });
 
+  await t.test("accepts optional additional information combinations and normalizes whitespace", async () => {
+    const originalConnect = pool.connect;
+    const insertedParams = [];
+    pool.connect = async () => ({
+      query: async (sql, params) => {
+        if (sql.includes("INSERT INTO applications")) {
+          insertedParams.push(params);
+          return {
+            rowCount: 1,
+            rows: [{
+              id: 700 + insertedParams.length,
+              application_number: `PEN-2026-OPTIONAL${insertedParams.length}`,
+              first_name: "Kwame",
+              last_name: "Mensah",
+              status: "new",
+              created_at: new Date().toISOString(),
+            }],
+          };
+        }
+        if (sql.includes("INSERT INTO guardians")) {
+          return { rowCount: 1, rows: [{ id: 800, full_name: "Ama Mensah" }] };
+        }
+        return { rowCount: 0, rows: [] };
+      },
+      release: () => {},
+    });
+
+    try {
+      const cases = [
+        {},
+        { current_previous_school: "Peniel Primary School" },
+        { additional_information: "Loves reading and science." },
+        {
+          current_previous_school: "  Peniel Primary School  ",
+          additional_information: "  Curious and enjoys group work.  ",
+        },
+        { current_previous_school: "   ", additional_information: "   " },
+      ];
+
+      for (const patch of cases) {
+        const res = await fetch(`${testEnv.baseUrl}/api/applications`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(validApplicationPayload(patch)),
+        });
+        assert.strictEqual(res.status, 201);
+      }
+
+      assert.deepStrictEqual(insertedParams[1].slice(-2), ["Peniel Primary School", null]);
+      assert.deepStrictEqual(insertedParams[2].slice(-2), [null, "Loves reading and science."]);
+      assert.deepStrictEqual(insertedParams[3].slice(-2), ["Peniel Primary School", "Curious and enjoys group work."]);
+      assert.deepStrictEqual(insertedParams[4].slice(-2), [null, null]);
+    } finally {
+      pool.connect = originalConnect;
+    }
+  });
+
+  await t.test("rejects oversized or invalid additional information fields with 400", async () => {
+    const cases = [
+      { additional_information: "a".repeat(2001) },
+      { current_previous_school: 123 },
+      { additional_information: ["invalid"] },
+    ];
+    for (const patch of cases) {
+      const res = await fetch(`${testEnv.baseUrl}/api/applications`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(validApplicationPayload(patch)),
+      });
+      assert.strictEqual(res.status, 400);
+    }
+  });
+
   await t.test("rejects invalid applicant emails with 400", async () => {
     const invalidEmails = [
       "plainaddress",
@@ -552,7 +625,7 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
     }
   });
 
-  await t.test("returns the original application when the same idempotency key is reused", async () => {
+  await t.test("does not assume an existing idempotency key without a fingerprint matches", async () => {
     const originalConnect = pool.connect;
     const mockClient = {
       query: async (sql, params) => {
@@ -607,10 +680,8 @@ test("Public Application Submission (POST /api/applications)", async (t) => {
       });
 
       const body = await res.json();
-      assert.strictEqual(res.status, 200);
-      assert.strictEqual(body.message, "Application already submitted.");
-      assert.strictEqual(body.application.id, 99);
-      assert.strictEqual(body.guardian.id, 999);
+      assert.strictEqual(res.status, 409);
+      assert.match(body.message, /already used for a different submission/i);
     } finally {
       pool.connect = originalConnect;
     }
