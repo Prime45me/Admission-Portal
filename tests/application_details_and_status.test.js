@@ -3,6 +3,61 @@ const assert = require("node:assert");
 const { startTestServer, createToken } = require("./test_helpers");
 const app = require("../server");
 const pool = require("../db/db");
+const resendEmail = require("../services/resendEmail");
+
+function createStatusClient(application, { updateError } = {}) {
+  return {
+    committed: false,
+    rolledBack: false,
+    async query(sql, params) {
+      const statement = sql.trim();
+      if (statement === "BEGIN") return { rowCount: null, rows: [] };
+      if (statement === "COMMIT") {
+        this.committed = true;
+        return { rowCount: null, rows: [] };
+      }
+      if (statement === "ROLLBACK") {
+        this.rolledBack = true;
+        return { rowCount: null, rows: [] };
+      }
+      if (statement.includes("FOR UPDATE")) {
+        return application
+          ? { rowCount: 1, rows: [{ ...application }] }
+          : { rowCount: 0, rows: [] };
+      }
+      if (statement.startsWith("UPDATE applications")) {
+        if (updateError) throw updateError;
+        application.status = params[0];
+        application.updated_at = new Date().toISOString();
+        return {
+          rowCount: 1,
+          rows: [{
+            id: application.id,
+            application_number: application.application_number,
+            status: application.status,
+            updated_at: application.updated_at,
+          }],
+        };
+      }
+      throw new Error("Unexpected status transaction query.");
+    },
+    release() {},
+  };
+}
+
+function createStatusApplication(overrides = {}) {
+  return {
+    id: 1,
+    application_number: "PEN-2026-TEST001",
+    first_name: "Kwame",
+    middle_name: "Kofi",
+    last_name: "Mensah",
+    email: "applicant@example.test",
+    status: "new",
+    updated_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
 
 test("Application Details (GET /:id) & Status Updates (PATCH /:id/status)", async (t) => {
   let testEnv;
@@ -131,8 +186,8 @@ test("Application Details (GET /:id) & Status Updates (PATCH /:id/status)", asyn
   });
 
   await t.test("PATCH /:id/status returns 404 when application does not exist", async () => {
-    const originalQuery = pool.query;
-    pool.query = async () => ({ rowCount: 0, rows: [] });
+    const originalConnect = pool.connect;
+    pool.connect = async () => createStatusClient(null);
 
     try {
       const res = await fetch(`${testEnv.baseUrl}/api/applications/99999/status`, {
@@ -144,27 +199,20 @@ test("Application Details (GET /:id) & Status Updates (PATCH /:id/status)", asyn
       assert.strictEqual(res.status, 404);
       assert.strictEqual(body.message, "Application not found.");
     } finally {
-      pool.query = originalQuery;
+      pool.connect = originalConnect;
     }
   });
 
   await t.test("PATCH /:id/status updates status case-insensitively and normalizes lowercase", async () => {
-    const originalQuery = pool.query;
-    let updateParams = null;
-
-    pool.query = async (sql, params) => {
-      updateParams = params;
-      return {
-        rowCount: 1,
-        rows: [
-          {
-            id: 1,
-            application_number: "PEN-2026-TEST001",
-            status: params[0],
-            updated_at: new Date().toISOString(),
-          },
-        ],
-      };
+    const originalConnect = pool.connect;
+    const originalSend = resendEmail.sendApplicationStatusNotification;
+    const application = createStatusApplication();
+    const client = createStatusClient(application);
+    const notifications = [];
+    pool.connect = async () => client;
+    resendEmail.sendApplicationStatusNotification = async (notification) => {
+      notifications.push(notification);
+      return { delivered: true };
     };
 
     try {
@@ -186,19 +234,144 @@ test("Application Details (GET /:id) & Status Updates (PATCH /:id/status)", asyn
         assert.strictEqual(res.status, 200);
         assert.strictEqual(body.message, "Application status updated successfully.");
         assert.strictEqual(body.application.status, tc.expected);
-        assert.strictEqual(updateParams[0], tc.expected);
       }
+      assert.deepStrictEqual(notifications.map(({ status }) => status), [
+        "accepted",
+        "under_review",
+        "rejected",
+        "new",
+      ]);
+      assert.ok(notifications.every((item) =>
+        item.to === "applicant@example.test" &&
+        item.applicantName === "Kwame Kofi Mensah" &&
+        item.applicationNumber === "PEN-2026-TEST001"
+      ));
     } finally {
-      pool.query = originalQuery;
+      pool.connect = originalConnect;
+      resendEmail.sendApplicationStatusNotification = originalSend;
     }
   });
 
-  await t.test("PATCH /:id/status rejects unauthorized requests without token (401)", async () => {
-    const res = await fetch(`${testEnv.baseUrl}/api/applications/1/status`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "accepted" }),
+  await t.test("PATCH /:id/status does not notify when the status is unchanged", async () => {
+    const originalConnect = pool.connect;
+    const originalSend = resendEmail.sendApplicationStatusNotification;
+    const client = createStatusClient(createStatusApplication({ status: "accepted" }));
+    let notificationCount = 0;
+    pool.connect = async () => client;
+    resendEmail.sendApplicationStatusNotification = async () => {
+      notificationCount += 1;
+      return { delivered: true };
+    };
+
+    try {
+      const res = await fetch(`${testEnv.baseUrl}/api/applications/1/status`, {
+        method: "PATCH",
+        headers: authHeaders,
+        body: JSON.stringify({ status: "ACCEPTED" }),
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual((await res.json()).application.status, "accepted");
+      assert.strictEqual(notificationCount, 0);
+      assert.strictEqual(client.committed, true);
+    } finally {
+      pool.connect = originalConnect;
+      resendEmail.sendApplicationStatusNotification = originalSend;
+    }
+  });
+
+  await t.test("email failure does not undo a committed status update", async () => {
+    const originalConnect = pool.connect;
+    const originalSend = resendEmail.sendApplicationStatusNotification;
+    const application = createStatusApplication();
+    const client = createStatusClient(application);
+    pool.connect = async () => client;
+    resendEmail.sendApplicationStatusNotification = async () => {
+      return { delivered: false, reason: "RESEND_DELIVERY_FAILED" };
+    };
+
+    try {
+      const res = await fetch(`${testEnv.baseUrl}/api/applications/1/status`, {
+        method: "PATCH",
+        headers: authHeaders,
+        body: JSON.stringify({ status: "accepted" }),
+      });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual((await res.json()).application.status, "accepted");
+      assert.strictEqual(application.status, "accepted");
+      assert.strictEqual(client.committed, true);
+      assert.strictEqual(client.rolledBack, false);
+    } finally {
+      pool.connect = originalConnect;
+      resendEmail.sendApplicationStatusNotification = originalSend;
+    }
+  });
+
+  await t.test("database update failure rolls back and does not send an email", async () => {
+    const originalConnect = pool.connect;
+    const originalSend = resendEmail.sendApplicationStatusNotification;
+    const application = createStatusApplication();
+    const client = createStatusClient(application, {
+      updateError: Object.assign(new Error("Mock database failure"), { code: "58030" }),
     });
-    assert.strictEqual(res.status, 401);
+    let notificationCount = 0;
+    pool.connect = async () => client;
+    resendEmail.sendApplicationStatusNotification = async () => {
+      notificationCount += 1;
+      return { delivered: true };
+    };
+
+    try {
+      const res = await fetch(`${testEnv.baseUrl}/api/applications/1/status`, {
+        method: "PATCH",
+        headers: authHeaders,
+        body: JSON.stringify({ status: "accepted" }),
+      });
+      assert.strictEqual(res.status, 500);
+      assert.strictEqual(application.status, "new");
+      assert.strictEqual(client.rolledBack, true);
+      assert.strictEqual(client.committed, false);
+      assert.strictEqual(notificationCount, 0);
+    } finally {
+      pool.connect = originalConnect;
+      resendEmail.sendApplicationStatusNotification = originalSend;
+    }
+  });
+
+  await t.test("PATCH /:id/status rejects unauthenticated and non-admin callers", async () => {
+    const originalConnect = pool.connect;
+    const originalSend = resendEmail.sendApplicationStatusNotification;
+    let connectCount = 0;
+    let notificationCount = 0;
+    pool.connect = async () => {
+      connectCount += 1;
+      throw new Error("Status route must not be reached.");
+    };
+    resendEmail.sendApplicationStatusNotification = async () => {
+      notificationCount += 1;
+      return { delivered: true };
+    };
+
+    try {
+      const unauthenticated = await fetch(`${testEnv.baseUrl}/api/applications/1/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "accepted" }),
+      });
+      const unauthorized = await fetch(`${testEnv.baseUrl}/api/applications/1/status`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${createToken({ id: 1, role: "teacher" })}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ status: "accepted" }),
+      });
+      assert.strictEqual(unauthenticated.status, 401);
+      assert.strictEqual(unauthorized.status, 403);
+      assert.strictEqual(connectCount, 0);
+      assert.strictEqual(notificationCount, 0);
+    } finally {
+      pool.connect = originalConnect;
+      resendEmail.sendApplicationStatusNotification = originalSend;
+    }
   });
 });

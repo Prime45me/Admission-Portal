@@ -5,7 +5,7 @@ const multer = require("multer");
 const pool = require("../db/db");
 const requireAdmin = require("../middleware/requireAdmin");
 const { uploadPassport, removePassport, createPassportSignedUrl } = require("../services/supabaseStorage");
-const { sendApplicationConfirmation } = require("../services/resendEmail");
+const resendEmail = require("../services/resendEmail");
 
 const router = express.Router();
 const applicationStatuses = [
@@ -788,7 +788,7 @@ router.post("/", (req, res, next) => {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    await sendApplicationConfirmation({
+    await resendEmail.sendApplicationConfirmation({
       to: email.trim(),
       applicationNumber: application.application_number,
     });
@@ -996,25 +996,98 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
 
   try {
     const normalizedStatus = status.trim().toLowerCase();
+    let client;
+    let currentApplication;
+    let updatedApplication;
+    let transactionStarted = false;
 
-    const result = await pool.query(
-      `UPDATE applications
-       SET status = $1,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
-       RETURNING id, application_number, status, updated_at`,
-      [normalizedStatus, applicationId]
-    );
+    try {
+      client = await pool.connect();
+      await client.query("BEGIN");
+      transactionStarted = true;
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        message: "Application not found.",
-      });
+      const currentResult = await client.query(
+        `SELECT id, application_number, first_name, middle_name, last_name, email, status
+         FROM applications
+         WHERE id = $1
+         FOR UPDATE`,
+        [applicationId]
+      );
+
+      if (currentResult.rowCount === 0) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+        return res.status(404).json({
+          message: "Application not found.",
+        });
+      }
+
+      currentApplication = currentResult.rows[0];
+      const updateResult = await client.query(
+        `UPDATE applications
+         SET status = $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2
+         RETURNING id, application_number, status, updated_at`,
+        [normalizedStatus, applicationId]
+      );
+
+      if (updateResult.rowCount !== 1) {
+        throw new Error("Locked application could not be updated.");
+      }
+
+      updatedApplication = updateResult.rows[0];
+      await client.query("COMMIT");
+      transactionStarted = false;
+    } catch (error) {
+      if (client && transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "Status update rollback error:",
+            rollbackError.code || "UNKNOWN"
+          );
+        }
+      }
+      throw error;
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
+
+    if (currentApplication.status !== normalizedStatus) {
+      const applicantName = [
+        currentApplication.first_name,
+        currentApplication.middle_name,
+        currentApplication.last_name,
+      ].filter(Boolean).join(" ");
+
+      try {
+        const delivery = await resendEmail.sendApplicationStatusNotification({
+          to: currentApplication.email,
+          applicantName,
+          applicationNumber: currentApplication.application_number,
+          status: normalizedStatus,
+        });
+        if (!delivery?.delivered) {
+          console.error(
+            "Application status notification not delivered:",
+            delivery?.reason || "UNKNOWN"
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Application status notification failed:",
+          error?.code || error?.name || "UNKNOWN"
+        );
+      }
     }
 
     return res.status(200).json({
       message: "Application status updated successfully.",
-      application: result.rows[0],
+      application: updatedApplication,
     });
   } catch (error) {
     console.error("Update status error:", error.code || "UNKNOWN");

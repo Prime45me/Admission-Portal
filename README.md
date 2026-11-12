@@ -20,6 +20,7 @@ The school website frontend lives in the sibling `frontend/` directory (React 18
 - Throttle password-reset requests by IP and normalized email without storing plaintext email addresses in rate-limit keys.
 - Protect application listing, detail, status-update, and dashboard-statistics routes with admin JWT authentication.
 - Provide dashboard counts for supported application statuses.
+- Send a branded Resend notification after each committed application status transition.
 - Validate submitted applicant/guardian fields, date of birth, email syntax, and Ghanaian phone number formats.
 - Limit repeated login attempts.
 - Check whether the API can connect to PostgreSQL.
@@ -63,8 +64,8 @@ backend/
 │   ├── application.js    # Application submission and review endpoints
 │   └── auth.js           # Administrator login endpoint
 ├── tests/                # Unit/API tests using node:test and mocked DB queries
-├── integration-tests/    # PostgreSQL-backed password-reset concurrency tests
-├── services/             # Reserved for business logic (currently empty)
+├── integration-tests/    # PostgreSQL-backed password-reset and status tests
+├── services/             # Resend email and Supabase Storage integrations
 ├── utils/                # Reserved for shared utilities (currently empty)
 ├── .env                  # Local secrets and configuration; do not commit
 ├── .gitignore            # Excludes node_modules and .env
@@ -142,7 +143,7 @@ The migration normalizes statuses in place, sets the lowercase `new` default, ma
 
 The development database was inspected read-only and already had the expected lowercase status default and constraint; the migration was not run. Check the target database before applying the migration in another environment.
 
-The manually applied `005_admin_password_reset_tokens.sql` table was inspected read-only and matches its migration definition. Before deploying token-version enforcement, manually apply the additive migration:
+The manually applied `005_admin_password_reset_tokens.sql` table was inspected read-only and matches its migration definition. Migration 006 was applied to the local database on 2026-11-12. For any other existing database, manually apply this additive migration before starting the updated backend:
 
 ```powershell
 psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migrations\006_admin_token_version.sql
@@ -156,7 +157,7 @@ The forgot-password endpoint returns a generic response and enforces a minimum r
 
 `npm run dev` starts the server with Nodemon. Use `npm start` to run it without Nodemon. The server listens on the configured port.
 
-## Passport photographs and confirmation email
+## Passport photographs and email notifications
 
 Application submission is multipart and requires a `passport` file in addition to the JSON form fields encoded as the `application` field. The browser must send up to 5 MB as JPEG, PNG, or WebP. The server verifies the file signature, stores it in a private Supabase Storage bucket, and records metadata in the existing `documents` table. For an existing database, apply:
 
@@ -167,6 +168,8 @@ psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migr
 Use the existing private Supabase Storage bucket named `applicant-documents`; confirm `SUPABASE_STORAGE_BUCKET=applicant-documents` in the backend environment. Do not create another bucket or make this bucket public. The service-role key must remain only in the backend environment. Suggested environment variables are documented in `.env.example`.
 
 When configured, Resend sends an HTML/plain-text confirmation after a first successful application commit. Duplicate idempotent retries do not send a second confirmation. If Resend is not configured or delivery fails, the application remains successfully submitted; delivery failures are logged without applicant-facing secret or API details.
+
+When an administrator changes an application to a different supported status, the backend locks and updates the application in a PostgreSQL transaction, commits, then sends a branded HTML/plain-text status notification through Resend. Repeating the current status does not send an email. Email delivery failures do not undo a committed status change. Email templates attach the school logo as an inline Content-ID image from `frontend/public/images/logo.jpeg`; it does not depend on `FRONTEND_URL`, which may be a local URL during development. The status notice also uses the contact details and admissions guidance published in the frontend. No notification outbox is used, so email delivery is best-effort and is not automatically retried after provider failure or process interruption.
 
 Administrators can access a photograph through the protected `GET /api/applications/:id/passport` endpoint. It verifies the application/document association and returns a signed URL valid for five minutes.
 
@@ -279,7 +282,7 @@ Returns one application and its guardian records as a `guardians` array. The sch
 
 #### `PATCH /api/applications/:id/status`
 
-Updates an application's status. The accepted values are `new`, `under_review`, `accepted`, and `rejected`; input is accepted case-insensitively and normalized to lowercase before saving.
+Updates an application's status. The accepted values are `new`, `under_review`, `accepted`, and `rejected`; input is accepted case-insensitively and normalized to lowercase before saving. A status notification is sent only when the status genuinely changes and after the database transaction commits. Repeating the current status does not send another notification; email failure does not roll back the update.
 
 Request:
 

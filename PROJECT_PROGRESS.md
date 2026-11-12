@@ -2,7 +2,7 @@
 
 **Last reviewed:** 2026-11-12
 **Project:** Peniel Admission Portal
-**Current phase:** Password-reset hardening and production-readiness verification
+**Current phase:** Admission status notifications and production-readiness verification
 
 This document records implemented backend, database, frontend, CI, upload, and email behavior. It is not evidence that live third-party services have been configured.
 
@@ -17,15 +17,16 @@ This document records implemented backend, database, frontend, CI, upload, and e
 | Passport upload | Implemented; live storage unverified | Required JPEG, PNG, or WebP multipart photograph, 5 MB limit, signature verification, random storage object names, private Supabase Storage upload, document metadata, and cleanup. |
 | Document metadata | Implemented with migration | Migration `003_passport_document_metadata.sql` safely adds MIME type and file-size metadata and lookup indexes. No image binaries are stored in PostgreSQL. |
 | Administrator photograph access | Implemented; live storage unverified | Protected `GET /api/applications/:id/passport` verifies the application/document association and returns a short-lived signed URL. |
-| Confirmation email | Implemented; live delivery unverified | Resend HTML/plain-text confirmation is sent after a new successful commit only. Missing credentials or delivery failures are non-fatal; duplicate retries do not resend. |
+| Confirmation email | Implemented; live delivery unverified | Resend HTML/plain-text confirmation is sent after a new successful commit only, with the school logo attached as an inline Content-ID image. Missing credentials or delivery failures are non-fatal; duplicate retries do not resend. |
+| Applicant status notifications | Implemented; live delivery unverified | After an authenticated administrator commits a genuine status change, Resend sends a branded HTML/plain-text message with the logo attached as an inline Content-ID image. Row locking prevents duplicate notifications for concurrent requests setting the same status; delivery is best-effort without an outbox. |
 | Application administration API | Implemented and verified locally | List/filter/page applications, statistics, detail retrieval, supported status updates, deletion where implemented, and admin authorization. |
 | Dashboard frontend | Implemented | Admin dashboard exists for application review and administrative operations; continue visual and integration verification against the real API/database. |
-| Admin login and sessions | Implemented; token-version migration pending | Bcrypt password hashes, one-hour JWTs with `token_version`, IP-based login throttling, server-side role/version checks, and session invalidation after password reset. |
+| Admin login and sessions | Implemented; token-version migration applied locally | Bcrypt password hashes, one-hour JWTs with `token_version`, IP-based login throttling, server-side role/version checks, and session invalidation after password reset. |
 | Admin password reset | Implemented; live email delivery unverified | Generic forgot-password response, hashed 30-minute single-use tokens, Resend integration, email and IP throttling, and transactional password/token-version updates. |
 | Reset-request throttling | Implemented; process-local | Limits requests by IP and normalized email using HMAC email keys. In-memory state is bounded and expires, but is not shared across instances or restarts. |
-| Database schema | Implemented with additive migrations | Starter schema plus status, idempotency/document, password-reset-token, and admin token-version migrations. Migration 005 was verified read-only in the local database; migration 006 has not been applied. |
-| Automated tests | Implemented and verified locally | Backend unit/API suite: 86 passed. PostgreSQL password-reset integration suite: 6 passed in an isolated temporary schema. |
-| Frontend build | Verified | Frontend React 18/Vite 6 production build completed successfully in clean validation. |
+| Database schema | Implemented with additive migrations | Starter schema plus status, idempotency/document, password-reset-token, and admin token-version migrations. Migration 005 was verified read-only and migration 006 was applied to the local database. |
+| Automated tests | Implemented and verified locally | Backend unit/API suite: 93 passed. PostgreSQL integration suites: 8 passed in isolated temporary schemas. |
+| Frontend build | Verified | Frontend production build completed successfully with npm; the build reports the existing large-chunk warning. |
 | CI workflow | Implemented | `.github/workflows/ci.yml` includes read-only permissions, separate backend/frontend jobs, backend `npm ci`, frontend frozen pnpm installation/build, and non-blocking audit reporting. Live GitHub Actions execution remains to be confirmed by the repository owner. |
 
 ## API routes
@@ -40,7 +41,7 @@ This document records implemented backend, database, frontend, CI, upload, and e
 - `GET /api/applications/stats` - protected dashboard counts.
 - `GET /api/applications/:id` - protected application and guardian detail.
 - `GET /api/applications/:id/passport` - protected five-minute Supabase signed-URL retrieval.
-- `PATCH /api/applications/:id/status` - protected status update with supported statuses.
+- `PATCH /api/applications/:id/status` - protected status update with supported statuses and post-commit email notifications for genuine changes.
 
 ## Environment and configuration
 
@@ -55,6 +56,8 @@ The backend requires PostgreSQL and JWT configuration. For Passport and email in
 - `RESET_RATE_LIMIT_SECRET` - optional HMAC key; defaults to `JWT_SECRET`.
 
 These values must remain server-side. `.env.example` contains placeholders only. The real `.env` must remain excluded from Git. Supabase and Resend credentials and live behavior have not been verified.
+
+Email templates load `frontend/public/images/logo.jpeg` from the repository and attach it inline with a Content-ID, so rendering does not depend on `FRONTEND_URL` or a public image URL. Mocked tests verify the attachment and HTML reference; rendering in an external inbox remains unverified.
 
 The forgot-password IP and account limiters use process-local memory. State resets on restart and is not shared across instances; multi-instance deployments need a shared rate-limit store. Reset emails are sent after the generic response without a durable queue, so abrupt process termination can interrupt delivery.
 
@@ -71,7 +74,7 @@ psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migr
 psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migrations\006_admin_token_version.sql
 ```
 
-Migration 005's table and indexes were inspected read-only in the local PostgreSQL database and match the migration. Migration 006 adds `admins.token_version INTEGER NOT NULL DEFAULT 0`; it was not applied. Review and manually apply 006 before starting the updated backend against an existing database. Do not recreate or truncate the database. Preserve existing applicant and administrator data.
+Migration 005's table and indexes were inspected read-only in the local PostgreSQL database and match the migration. Migration 006 adds `admins.token_version INTEGER NOT NULL DEFAULT 0` and was applied to the local database on 2026-11-12. Review and manually apply it to any other existing database before starting the updated backend there. Do not recreate or truncate the database. Preserve existing applicant and administrator data.
 
 ## Important gaps and risks
 
@@ -93,6 +96,8 @@ Migration 005's table and indexes were inspected read-only in the local PostgreS
 - [x] Required passport selection, preview, replacement, removal, frontend validation, and multipart submission.
 - [x] Backend signature/type validation, 5 MB limit, private Supabase Storage, metadata migration, cleanup, and signed URLs.
 - [x] Optional Resend confirmation email and duplicate-retry suppression.
+- [x] Branded applicant status notifications after committed admin status changes.
+- [x] Inline Content-ID logo attachment in confirmation, password-reset, and status notification emails.
 - [x] Admin forgot/reset-password flow with hashed single-use tokens and generic responses.
 - [x] JWT token-version enforcement and password-reset session invalidation implementation.
 - [x] Account/email reset throttling, bounded in-memory state, and admin-first PostgreSQL locking.
@@ -102,7 +107,7 @@ Migration 005's table and indexes were inspected read-only in the local PostgreS
 
 ## Remaining work
 
-- [ ] Review and manually apply migration `006_admin_token_version.sql` to target databases before deploying the updated backend.
+- [ ] Apply migration `006_admin_token_version.sql` to any target database where it has not yet been applied.
 - [ ] Configure the private Supabase bucket and policies with real project credentials.
 - [ ] Verify a live passport upload, signed URL, and cleanup behavior.
 - [ ] Verify Resend sender and confirmation email delivery with real credentials.
@@ -114,5 +119,6 @@ Migration 005's table and indexes were inspected read-only in the local PostgreS
 
 ## Update log
 
-- **2026-11-12:** Documented password-reset security hardening: administrator JWT token versions, account-based reset throttling, admin-first reset-token locking, 86 passing backend unit/API tests, and 6 passing PostgreSQL integration tests. Migration 006 remains unapplied; Resend live delivery and multi-instance rate-limit behavior remain unverified.
+- **2026-11-12:** Added applicant status-change notifications after committed administrator updates. Verification: 92 backend unit/API tests, 8 PostgreSQL integration tests, and frontend production build passed. Emails are best-effort without a durable outbox; no real applicant emails were sent. Migration 006 is applied to the local database; live Resend delivery and multi-instance rate-limit behavior remain unverified.
+- **Latest logo verification:** All 93 backend unit/API tests, 8 PostgreSQL integration tests, and the frontend production build passed. Mocked tests confirm the actual repository logo bytes are attached and all three email templates reference the matching CID; actual inbox rendering and live delivery remain unverified.
 - **2026-10-31:** Updated the project record for database idempotency verification, private Supabase passport uploads, protected signed-URL retrieval, Resend confirmation delivery, GitHub Actions CI, migration requirements, and the latest verified backend test/build status. Live credential-dependent behavior remains unverified.
