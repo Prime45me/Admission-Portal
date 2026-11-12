@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS admins (
     email VARCHAR(150) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(30) NOT NULL DEFAULT 'admin',
+    token_version INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

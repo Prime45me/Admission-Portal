@@ -15,6 +15,9 @@ The school website frontend lives in the sibling `frontend/` directory (React 18
 - Retrieve an application together with all guardian records.
 - Change an application's status.
 - Authenticate an administrator using a password hash and issue a one-hour JSON Web Token (JWT).
+- Invalidate prior administrator JWTs after a password reset using a database-backed token version.
+- Provide generic forgot-password requests and single-use, 30-minute reset links using SHA-256 token hashes and the existing Resend integration.
+- Throttle password-reset requests by IP and normalized email without storing plaintext email addresses in rate-limit keys.
 - Protect application listing, detail, status-update, and dashboard-statistics routes with admin JWT authentication.
 - Provide dashboard counts for supported application statuses.
 - Validate submitted applicant/guardian fields, date of birth, email syntax, and Ghanaian phone number formats.
@@ -34,7 +37,7 @@ The school website frontend lives in the sibling `frontend/` directory (React 18
 - PostgreSQL via `pg`
 - `bcrypt` for administrator password hashing
 - `jsonwebtoken` for login tokens
-- `express-rate-limit` for login throttling
+- `express-rate-limit` for IP-based login and password-reset throttling
 - `dotenv` for local environment configuration
 
 The package manifest does not specify a Node.js engine version. Use a currently supported Node.js LTS release compatible with the installed dependencies.
@@ -48,13 +51,19 @@ backend/
 │   ├── db.js             # PostgreSQL connection pool
 │   ├── schema.sql        # Starter schema for a development database
 │   └── migrations/
-│       └── 001_normalize_application_status.sql
+│       ├── 001_normalize_application_status.sql
+│       ├── 002_application_idempotency_keys.sql
+│       ├── 003_passport_document_metadata.sql
+│       ├── 004_additional_information_and_payload_fingerprint.sql
+│       ├── 005_admin_password_reset_tokens.sql
+│       └── 006_admin_token_version.sql
 ├── middleware/
-│   └── requireAdmin.js   # Verifies JWT and requires the admin role
+│   └── requireAdmin.js   # Verifies JWT, token version, and admin role
 ├── routes/
 │   ├── application.js    # Application submission and review endpoints
 │   └── auth.js           # Administrator login endpoint
-├── tests/                # API tests using node:test and mocked DB queries
+├── tests/                # Unit/API tests using node:test and mocked DB queries
+├── integration-tests/    # PostgreSQL-backed password-reset concurrency tests
 ├── services/             # Reserved for business logic (currently empty)
 ├── utils/                # Reserved for shared utilities (currently empty)
 ├── .env                  # Local secrets and configuration; do not commit
@@ -96,6 +105,9 @@ DB_USER=your_database_user
 DB_PASSWORD=your_database_password
 
 JWT_SECRET=replace_with_a_long_random_secret
+FRONTEND_URL=http://localhost:5173
+# Optional; defaults to JWT_SECRET.
+RESET_RATE_LIMIT_SECRET=replace_with_a_long_random_secret
 CORS_ORIGINS=http://localhost:5173
 
 ADMIN_NAME=Portal Administrator
@@ -129,6 +141,18 @@ psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migr
 The migration normalizes statuses in place, sets the lowercase `new` default, makes the column `NOT NULL`, and adds the supported-status constraint. It does not delete application records.
 
 The development database was inspected read-only and already had the expected lowercase status default and constraint; the migration was not run. Check the target database before applying the migration in another environment.
+
+The manually applied `005_admin_password_reset_tokens.sql` table was inspected read-only and matches its migration definition. Before deploying token-version enforcement, manually apply the additive migration:
+
+```powershell
+psql -v ON_ERROR_STOP=1 -U your_database_user -d your_database_name -f .\db\migrations\006_admin_token_version.sql
+```
+
+The migration adds `admins.token_version INTEGER NOT NULL DEFAULT 0`; it does not recreate tables or alter applicant or administrator identity data. Do not start the updated backend against a database until this migration has been reviewed and applied. Existing JWTs without a `token_version` claim are treated as version `0`; a successful password reset increments the database value and invalidates those sessions.
+
+Forgot-password requests remain limited by IP (5 per 15 minutes) and are additionally limited by normalized email (3 per 15 minutes). Email rate-limit keys are HMAC-SHA-256 digests, not stored email addresses. `RESET_RATE_LIMIT_SECRET` may be set to a long random secret; otherwise `JWT_SECRET` is used. Both rate limiters use process-local in-memory state: limits reset on process restart and are not shared across multiple server instances. The email limiter's state is bounded to 10,000 keys with a 15-minute expiry and fails closed for new keys while at capacity. Multi-instance deployments need a shared rate-limit store to enforce a global limit.
+
+The forgot-password endpoint returns a generic response and enforces a minimum response duration. Resend delivery starts after the HTTP response and uses the existing integration; no queue is introduced. Because delivery is not durable, abrupt process termination can interrupt an in-flight reset email.
 
 `npm run dev` starts the server with Nodemon. Use `npm start` to run it without Nodemon. The server listens on the configured port.
 
@@ -173,6 +197,16 @@ Request:
 ```
 
 On success, returns a JWT that expires after one hour and basic administrator details. Use the token as a Bearer token for protected application routes. The login route allows up to 10 attempts per 15-minute window per rate-limit policy. Invalid credentials return HTTP 401; missing or invalid required fields return HTTP 400.
+
+#### `POST /api/auth/forgot-password`
+
+Accepts an administrator email and returns the same generic HTTP 200 response for registered and unregistered addresses. Requests are limited to 5 per IP and 3 per normalized email in a 15-minute window. A reset token is generated with a cryptographically secure random source; only its SHA-256 hash is stored, and it expires after 30 minutes. The reset email uses the configured `FRONTEND_URL`. Resend delivery starts after the generic response, so email latency or failure does not alter the response.
+
+#### `POST /api/auth/reset-password`
+
+Accepts the reset token and a new password. The token must be unused and unexpired. Password change, token-version increment, and invalidation of other active reset tokens run in one transaction. Each protected request checks the JWT's `token_version` against the administrator row; a successful reset therefore rejects previously issued sessions.
+
+Run mocked backend unit/API tests with `npm test`. Run PostgreSQL-backed password-reset integration tests with `npm run test:integration`; they create and remove a uniquely named temporary schema and do not apply migrations to the configured public schema. The integration database user must be allowed to create and drop schemas.
 
 ### Applications
 

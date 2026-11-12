@@ -3,11 +3,47 @@ const jwt = require("jsonwebtoken");
 process.env.NODE_ENV = "test";
 process.env.JWT_SECRET = "test_jwt_secret_key_1234567890";
 
+let tokenVersionQueryMockEnabled = true;
+let tokenVersionQueryMockValue = 0;
+let tokenVersionQueryMockInstalled = false;
+
+function installTokenVersionQueryMock() {
+  if (tokenVersionQueryMockInstalled) return;
+  const pool = require("../db/db");
+  const originalQuery = pool.query.bind(pool);
+  let override;
+  const testQuery = (sql, ...args) => {
+    if (
+      tokenVersionQueryMockEnabled &&
+      typeof sql === "string" &&
+      /^\s*SELECT token_version FROM admins WHERE id = \$1/i.test(sql)
+    ) {
+      return Promise.resolve({ rows: [{ token_version: tokenVersionQueryMockValue }] });
+    }
+    return (override || originalQuery)(sql, ...args);
+  };
+
+  Object.defineProperty(pool, "query", {
+    configurable: true,
+    get: () => testQuery,
+    set: (query) => {
+      override = query === testQuery ? undefined : query;
+    }
+  });
+  tokenVersionQueryMockInstalled = true;
+}
+
+function setTokenVersionQueryMockEnabled(enabled, version = 0) {
+  tokenVersionQueryMockEnabled = enabled;
+  tokenVersionQueryMockValue = version;
+}
+
 function createToken(payload = { id: 1, role: "admin" }, options = { expiresIn: "1h" }) {
   return jwt.sign(payload, process.env.JWT_SECRET, options);
 }
 
 function startTestServer(app) {
+  installTokenVersionQueryMock();
   return new Promise((resolve) => {
     const server = app.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
@@ -46,4 +82,5 @@ module.exports = {
   createToken,
   startTestServer,
   validApplicationPayload,
+  setTokenVersionQueryMockEnabled
 };

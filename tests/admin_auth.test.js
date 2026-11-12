@@ -1,6 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert");
-const { startTestServer, createToken } = require("./test_helpers");
+const {
+  startTestServer,
+  createToken,
+  setTokenVersionQueryMockEnabled,
+} = require("./test_helpers");
 const app = require("../server");
 const pool = require("../db/db");
 
@@ -88,6 +92,9 @@ test("Admin Authentication & Route Protection", async (t) => {
   await t.test("allows protected route access with valid admin token (200)", async () => {
     const originalQuery = pool.query;
     pool.query = async (sql) => {
+      if (sql.includes("SELECT token_version FROM admins")) {
+        return { rows: [{ token_version: 0 }] };
+      }
       if (sql.includes("COUNT(*)")) {
         return { rows: [{ count: "0" }] };
       }
@@ -104,6 +111,23 @@ test("Admin Authentication & Route Protection", async (t) => {
       assert.strictEqual(body.total, 0);
       assert.deepStrictEqual(body.applications, []);
     } finally {
+      pool.query = originalQuery;
+    }
+  });
+
+  await t.test("rejects a JWT whose token version no longer matches the administrator", async () => {
+    const originalQuery = pool.query;
+    setTokenVersionQueryMockEnabled(true, 1);
+
+    try {
+      const oldToken = createToken({ id: 1, role: "admin", token_version: 0 });
+      const res = await fetch(`${testEnv.baseUrl}/api/applications`, {
+        headers: { Authorization: `Bearer ${oldToken}` },
+      });
+      assert.strictEqual(res.status, 401);
+      assert.strictEqual((await res.json()).message, "Invalid or expired token");
+    } finally {
+      setTokenVersionQueryMockEnabled(true, 0);
       pool.query = originalQuery;
     }
   });

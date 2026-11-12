@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 const { startTestServer } = require("./test_helpers");
 const app = require("../server");
 const pool = require("../db/db");
@@ -95,6 +96,7 @@ test("Admin Login (POST /api/auth/login)", async (t) => {
           email: "admin@example.com",
           password_hash: realHash,
           role: "admin",
+          token_version: 7,
         },
       ],
     });
@@ -126,6 +128,7 @@ test("Admin Login (POST /api/auth/login)", async (t) => {
           email: "headmaster@peniel.edu.gh",
           password_hash: realHash,
           role: "admin",
+          token_version: 7,
         },
       ],
     });
@@ -144,6 +147,7 @@ test("Admin Login (POST /api/auth/login)", async (t) => {
       assert.strictEqual(data.admin.full_name, "Headmaster");
       assert.strictEqual(data.admin.email, "headmaster@peniel.edu.gh");
       assert.strictEqual(data.admin.role, "admin");
+      assert.strictEqual(jwt.verify(data.token, process.env.JWT_SECRET).token_version, 7);
       // Password hash must never be returned
       assert.strictEqual(data.admin.password_hash, undefined);
     } finally {
